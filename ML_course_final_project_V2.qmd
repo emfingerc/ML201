@@ -1,0 +1,189 @@
+---
+title: "ML_project"
+author: "C. Emfinger"
+format: html
+editor: visual
+---
+
+## ML course final project
+
+Your goal is to write an R function that takes as an **input a named vector gene expression values and predicts what call type it is.**
+
+Optionally, you can also provide a **probability for each of the 10 possible cell types.**
+
+## **Instructions to Download Data and Develop Function:**
+
+To develop this function you can use the `pbmc_facs$counts` and `pbmc_facs$samples$celltype` dataset we worked on during class. You can load the dataset using this line of code after installing the `fastTopics` package:
+
+`data("pbmc_facs", package = "fastTopics")`
+
+**Notes:** the name of the vector of gene expression should have the gene names you get from `colnames(pbmc_facs$counts)`. Your function should check that the names of the input vector match what your algorithm expects.
+
+## **Rubric:**
+
+**For your final report, it should include the following:**\
+1) The code you used to train your model.
+
+2\) The code of your prediction function.
+
+3\) The accuracy and confusion Matrix you obtained when applying your function to the `pbmc_facs$counts_test` and comparing to the `pbmc_facs$samples_test$celltypes`.
+
+4\) A paragraph with an interpretation that biologists can understand\
+of what your function does.\
+\
+5) Upload your file on Ed. This is so we can provide feedback and a grade!
+
+6\) Upload your quarto file on GitHub. We will have a lecture on 4/24 on how to do this and why this is important!
+
+***Solution:***
+
+**Purpose:**
+
+A frequent problem in single-cell data is inference of which cell types correspond to each sample cell. The purpose of this function is to infer computationally what those cell types are. It takes as its input a matrix which is a set of cells (rows) with corresponding gene counts (columns). Column names (the gene names) should match that found in the PBMC facs dataset (`data("pbmc_facs", package = "fastTopics").` The function generates a model using the PBMC facs dataset and applies that model to the input cell data, returning the model generated, the metrics for that model, predicted cell types, and the heatmap showing for each cell what the probability of being a specific cell type is.
+
+Note- use set.seed to control reproducibility. The seed set for testing this function was **set.seed(2024-04-23)**.
+
+The options in the function currently are the number of threads ("threads", an integer; if not chosen the function chooses 2 less than the maximum number of available threads) and the model_list argument.
+
+model_list is a vector which lists the types of models to be generated (these are caret designations, e.g. "rf", "gbm", etc). The ones used to test this were "gbm" and "rf".
+
+The **integrated function** is:
+
+```{r}
+cell_type_prediction <- function(cell_counts,
+                                 model_list=c("gbm","rf"),
+                                 threads = 0){
+  
+  # load libraries-------------------------------------------
+  library(tidyverse)
+  library(caret)
+  library(dslabs)
+  library(matrixStats)
+  library(fastTopics)
+  library(doParallel)
+  library(parallel)
+  library(foreach)
+  library(caretEnsemble)
+  library(pheatmap)
+  
+  # set parallelization--------------------------------------
+  if (threads ==0){
+  nc <- detectCores()  - 2 # convention to leave 2 cores for OS; some use one but I find my computer crashing when I try that; for the testing of this function I used a server with 24 threads assigned.
+  }
+  if (threads > 0){
+    nc <- threads
+  }
+  cl <- makeCluster(nc) 
+  # note that for this I used a server with 24 cores dedicated to this
+  registerDoParallel(cl)
+
+  # load model construction data-----------------------------
+  # load the dataset
+  facs_data <- data(pbmc_facs)
+
+  # set the predictors
+  genes <- as.matrix(pbmc_facs$counts)
+  genes2 <- as.matrix(pbmc_facs$counts_test)
+  # rownames are probes
+  # column names are genes
+
+  # set outcomes
+  cell_types <- pbmc_facs$samples$celltype
+  cell_types_test <- pbmc_facs$samples_test$celltype
+  
+  # check the formatting of the input data------------------
+  test_format <- unique(colnames(cell_counts) %in% colnames(genes))
+  if (test_format == FALSE){
+    print("none of your genes are in the pbmc dataset")
+    break
+  }
+  if (length(test_format) > 1){
+    print("some of your genes are not in the pbmc dataset")
+    break
+  }
+  
+  # set training methods-------------------------------------
+  ctrl1 <- trainControl(method = "repeatedcv",
+                     p = 0.95,
+                     number = 20,
+                     repeats = 3,
+                     preProcOptions = list(thresh = 0.75), # this is the option for PCA analysis in the training step
+                     allowParallel=TRUE,
+  )
+  
+  # train the models-----------------------------------------
+  models <- caretList(x = data.frame(genes), y = as.factor(cell_types), trControl = ctrl1,
+                    preProcess = c("nzv", # eliminates near-zero variance
+                               "center", # centers the values to mean for each of the parameters
+                               "scale", # scales the values for standardization, 
+                               "YeoJohnson", # transforms data for normalization and to limit the sparsity issue in single-cell reads.
+                               "pca" # reduces the dimensions of the data
+                               ), methodList = model_list
+                    )
+  #note- the original testing of this used c("gbm","rf") as the model_list; because of the repeat CV it took a while
+  
+  # predict the outcomes-------------------------------------
+  # determine the model with the most accuracy
+  # set the predictions list objects
+  predictions <- list()
+  predictions_prob <- list()
+  # determine predictions of cell type
+  predictions <- foreach(i = 1:length(models), packages = c("caret","tidyverse")) %dopar% {
+  predictions[[i]]<-predict(models[[i]], newdata = genes2, type="raw")
+}
+  # determine probability of cell type
+  predictions_prob <- foreach(i = 1:length(models), packages = c("caret","tidyverse")) %dopar% {
+    predictions_prob[[i]]<-predict(models[[i]], newdata = genes2, type="prob")
+}
+  # set names of the predictions to match the models 
+  names(predictions)<-names(models)
+  names(predictions_prob)<-names(models)
+
+  # create the confusion matrices
+  confusion_matrices <- list()
+  for (i in 1:length(models)){
+    confusion_matrices[[i]] <- confusionMatrix(predictions[[i]], 
+    cell_types_test,
+    dnn = c("prediction","true"))
+}
+  names(confusion_matrices)<-names(models)
+  
+  # set accuracy variable
+acc <- data.frame(matrix(nrow=length(models), ncol=1))
+colnames(acc)<-"overall_accuracy"
+rownames(acc)<-names(models)
+for (i in 1:nrow(acc)){
+  acc$overall_accuracy[i]<-confusion_matrices[[i]]$overall["Accuracy"]
+}
+most_acc <- which(acc$overall_accuracy == max(acc$overall_accuracy))
+
+  # use the most accurate model to predict cell types for the input data---------------------------------------------------
+cell_type_predictions <- list()
+cell_type_predictions[[1]] <- predict(models[[most_acc]], newdata=cell_counts, type="raw")
+cell_type_predictions[[2]] <- predict(models[[most_acc]], newdata=cell_counts, type="prob")
+names(cell_type_predictions)<-c("prediction", "probability")
+
+  # plot the probable cell types----------------------------
+  probs_heatmap <- pheatmap(as.matrix(cell_type_predictions$probability),
+         cluster_rows = FALSE)
+
+  # set the model object------------------------------------
+  model_object <- list()
+model_object[[1]] <- models[[most_acc]]
+model_object[[2]] <- confusion_matrices[[most_acc]]
+  names(model_object)<-c(names(models)[most_acc],"confusion_matrix")
+
+  # return the model, confusion matrix, predictions, and heatmap-----------------------------------------------------
+  return(probs_heatmap, cell_type_predictions, model_object)
+  
+  # stop the parallelization---------------------------------
+  stopCluster(cl)
+  stopImplicitCluster()
+
+  # end of function------------------------------------------
+}
+```
+
+The share link for the environment with the variables is:
+
+<https://drive.google.com/file/d/1cu8K6Tc3YhoV24z_LJQ8LfzpYEPU9Ng5/view?usp=sharing>
